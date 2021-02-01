@@ -1,0 +1,297 @@
+#+startup: showall
+
+* DPDK配置
+** 绑定网口到dpdk驱动
++ 使用vfio驱动绑定网口
+#+BEGIN_SRC shell
+  #for vfio
+  sudo modprobe vfio-pci
+  sudo /usr/bin/chmod a+x /dev/vfio
+  sudo /usr/bin/chmod 0666 /dev/vfio/*
+  sudo ifconfig eth0 down
+  sudo $DPDK_DIR/usertools/dpdk-devbind.py --bind=vfio-pci eth0
+  sudo $DPDK_DIR/usertools/dpdk-devbind.py --status
+  sudo mount -t hugetlbfs none /dev/huge
+#+END_SRC
++ 使用uio驱动绑定网口
+
+  #+BEGIN_SRC shell
+    #for igb_uio
+    sudo modprobe uio
+    sudo insmod $DPDK_DIR/x86_64-native-linuxapp-gcc/kmod/igb_uio.ko
+
+    sudo ifconfig eth0 down
+    sudo $DPDK_DIR/usertools/dpdk-devbind.py --bind=igb_uio eth0
+    sudo $DPDK_DIR/usertools/dpdk-devbind.py --status
+    sudo mount -t hugetlbfs none /dev/huge
+  #+END_SRC
+ 这里的网口名ens38是在vmware配置的虚拟网口，内核驱动是e1000,dpdk驱动对支持的硬件是有要求的，具体可以查看dpdk官网 [[http://core.dpdk.org/supported/][dpdk支持的硬件类型]]
+
+ #+BEGIN_SRC shell
+   ethtool -i ens38
+ #+END_SRC
++ 修改dpdk源码，才能支持虚拟机的虚拟网卡
+
+  #+BEGIN_SRC C
+    //执行test程序时输出：
+
+    //EAL: Error reading from file descriptor 23: Input/output error
+
+    //原因：在虚拟机添加的网卡，dpdk不支持导致的。需要修改一行代码，跳过dpdk pci 检查修改代码行
+    lib/librte_eal/linuxapp/igb_uio/igb_uio.c
+
+    //找到
+      case RTE_INTR_MODE_LEGACY:
+        if (pci_intx_mask_supported(udev->pdev)) {
+          dev_dbg(&udev->pdev->dev, "using INTX");
+          udev->info.irq_flags = IRQF_SHARED | IRQF_NO_THREAD;
+          udev->info.irq = udev->pdev->irq;
+          udev->mode = RTE_INTR_MODE_LEGACY;
+          break;
+        }
+        dev_notice(&udev->pdev->dev, "PCI INTX mask not supported\n");
+
+
+    //这行代码,然后修改为
+      case RTE_INTR_MODE_LEGACY:
+    //		if (pci_intx_mask_supported(udev->pdev)) {
+          dev_dbg(&udev->pdev->dev, "using INTX");
+          udev->info.irq_flags = IRQF_SHARED | IRQF_NO_THREAD;
+          udev->info.irq = udev->pdev->irq;
+          udev->mode = RTE_INTR_MODE_LEGACY;
+          break;
+    //		}
+    //		dev_notice(&udev->pdev->dev, "PCI INTX mask not supported\n");
+  #+END_SRC
+ 重新编译后
+ rmmod igb_uio
+
+ 然后再
+ insmod igb_uio
+
++ 运行dpdk的测试例子
+
+  #+BEGIN_SRC shell
+    cd $DPDK_DIR/examples/l2fwd
+    make
+    sudo $DPDK_DIR/examples/l2fwd/build/l2fwd -l 0-1 -w 01:00.0 – -p 0x1
+  #+END_SRC
+
+
+
+* 依赖安装
+dnf -y install gcc-toolset-9-gcc gcc-toolset-9-gcc-c++
+source /opt/rh/gcc-toolset-9/enable
+dnf --enablerepo=PowerTools install ninja-build
+sudo yum install devtoolset-7
+scl enable devtoolset-7 bash
+yum install libasan
+yum install "ragel*" libnuma
+yum install xfsprogs* valgrind-devel systemtap-sdt-devel gmp*
+yum install gnutls*
+** ragel
+
+#+BEGIN_SRC shell
+  wget http://www.colm.net/files/ragel/ragel-6.10.tar.gz
+  cd ragel-6.10/
+  sed -i "s/ CHAR_M/ SCHAR_M/g" ragel/common.cpp
+  ./configure --prefix=/media/psf/Home/workspace/github/seastar/contrib/ragel
+
+#+END_SRC
+
+** dpdk
+
+#+BEGIN_SRC shell
+  yum install kernel-devel 
+   git submodule update --init --recursive
+   yum install "numactl-devel*x86_64" 
+   make config CC=gcc T=x86_64-native-linuxapp-gcc
+  EXTRA_CFLAGS="-Werror=missing-attributes -Wno-unknown-warning -Wno-error -Wno-strict-prototypes -I/media/psf/Home/workspace/github/seastar/contrib/numactl/include" EXTRA_LDFLAGS="-L/media/psf/Home/workspace/github/seastar/contrib/numactl/lib" prefix=dpdk make -j `nproc` RTE_KERNELDIR=/usr/src/kernels/versions
+  prefix=dpdk DESTDIR=/media/psf/Home/workspace/github/seastar/contrib/ make install
+#+END_SRC
++ 高版本gcc编译, numa.h里加入#pragma GCC diagnostic ignored "-Wcast-qual"
++ 编译参数添加-Wno-strict-prototypes
++ build目录下.config里的CONFIG_RTE_MBUF_REFCNT_ATOMIC=n 设置为n
++ centos gcc9兼容 /usr/src/kernels/3.10.0-1160.11.1.el7.x86_64/include/linux/init.h 312 行int init_module(void) __cold __attribute__((alias(#initfn)));
+
+** boost
+#+BEGIN_SRC shell
+  wget https://dl.bintray.com/boostorg/release/1.65.1/source/boost_1_65_1.tar.gz
+  ./bootstrap.sh
+  ./b2
+   ./b2 install --prefix=/media/psf/Home/workspace/github/seastar/contrib/boost  link=static variant=release threading=multi
+
+  #系统安装
+  yum -y install gcc-c++ python-devel bzip2-devel zlib-devel
+  wget https://repo.continuum.io/archive/Anaconda3-2018.12-Linux-x86_64.sh
+  bash Anaconda3-2018.12-Linux-x86_64.sh 
+
+  ./bootstrap.sh --prefix=/usr/local/boost --with-python=/usr/anaconda3/bin/python3 --with-python-root=/usr/anaconda3/bin/python3
+  ./b2
+  ./b2 install
+
+  cd tools/build
+  ./bootstrap.sh
+
+  ./b2 install --prefix=/usr/local/boost
+#+END_SRC
+
+**  c-ares
+
+#+BEGIN_SRC shell
+  #git clone https://github.com/c-ares/c-ares.git
+  #git checkout cares-1_13_0
+  wget https://c-ares.haxx.se/download/c-ares-1.13.0.tar.gz
+  ./buildconf
+   ./configure --prefix=/media/psf/Home/workspace/github/seastar/contrib/c-ares
+  make -j10
+  make install
+#+END_SRC
+
+** cryptopp
+#+BEGIN_SRC shell
+  #https://github.com/weidai11/cryptopp/archive/CRYPTOPP_5_6_5.tar.gz
+  git clone https://github.com/weidai11/cryptopp.git
+  git checkout CRYPTOPP_5_6_5
+  make libcryptopp.a
+  PREFIX=/media/psf/Home/workspace/github/seastar/contrib/cryptopp make install 
+#+END_SRC
+** fmt
+
+#+BEGIN_SRC shell
+  #https://github.com/fmtlib/fmt/archive/5.2.1.tar.gz
+  git clone https://github.com/fmtlib/fmt.git
+  git checkout 5.0.0
+  mkdir release
+  cd release 
+   cmake -DFMT_INSTALL=yes -DCMAKE_INSTALL_PREFIX=/media/psf/Home/workspace/github/seastar/contrib/fmt ..
+  make -j 10 
+  make install
+#+END_SRC
+
+** gmp
+
+#+BEGIN_SRC shell
+  wget https://gmplib.org/download/gmp/gmp-6.1.2.tar.bz2
+  ./configure --enable-static=true --enable-shared=no --prefix=/media/psf/Home/workspace/github/seastar/contrib/gmp
+#+END_SRC
+
+** gnutls
+yum install flex byacc
+先安装 gmp nettle,yum instll autogen yum install libidn*
+未解决
+#+BEGIN_SRC shell
+  # git clone https://github.com/gnutls/gnutls.git
+  #wget https://www.gnupg.org/ftp/gcrypt/gnutls/v3.5/gnutls-3.5.18.tar.xz
+   #git checkout gnutls_3_3_26
+   #make
+   #./configure --prefix=/media/psf/Home/workspace/github/seastar/contrib/gnutls
+   #CXXFLAGS="-I/media/psf/Home/workspace/github/seastar/contrib/gmp/include -I/media/psf/Home/workspace/github/seastar/contrib/nettle/include"  #LDFLAGS="-L/media/psf/Home/workspace/github/seastar/contrib/gmp/lib -L/media/psf/Home/workspace/github/seastar/contrib/nettle/lib64" 
+  GMP_CFLAGS="-I/media/psf/Home/workspace/github/seastar/contrib/gmp/include" GMP_LIBS="-L/media/psf/Home/workspace/github/seastar/contrib/gmp/lib -lgmp" NETTLE_CFLAGS="-I/media/psf/Home/workspace/github/seastar/contrib/nettle/include" NETTLE_LIBS="-L/media/psf/Home/workspace/github/seastar/contrib/nettle/lib64 -lnettle " HOGWEED_CFLAGS="-I/usr/include" HOGWEED_LIBS="-L/usr/lib64/ -lhogweed"  ./configure --with-libintl-prefix=/media/psf/Home/workspace/github/seastar/contrib/nettle --enable-static=yes --enable-shared=no --prefix=/usr/local/gnutls --with-included-unistring --with-included-libtasn1  --without-p11-kit --disable-non-suiteb-curves --disable-doc
+  #yum install gnutls-devel
+#+END_SRC
+ 
+** colm
+
+#+BEGIN_SRC shell
+
+  wget http://www.colm.net/files/colm/colm-0.13.0.6.tar.gz
+  tar -xvf colm-0.13.0.6.tar.gz -C colm-0.13.0.6  
+  ./configure --enable-shared=no --enable-static=yes --prefix=/media/psf/Home/workspace/github/seastar/contrib/colm
+
+  make ; make install
+#+END_SRC
+
+** libpciaccess
+
+#+BEGIN_SRC shell
+   wget https://www.x.org/releases/individual/lib/libpciaccess-0.13.4.tar.gz
+  tar -xvf libpciaccess-0.13.4.tar.gz
+  cd libpciaccess-0.13.4 
+  ./configure --enable-shared=no --enable-static=yes --prefix=/media/psf/Home/workspace/github/seastar/contrib/libpciaccess
+  make -j10
+  make install
+#+END_SRC
+
+** nettle
+
+#+BEGIN_SRC shell
+  wget https://ftp.gnu.org/gnu/nettle/nettle-3.4.tar.gz
+  tar -xvf nettle-3.4.tar.gz #--enable-mini-gmp
+  ./configure  --disable-shared --disable-pic --prefix=/media/psf/Home/workspace/github/seastar/contrib/nettle --with-include-path=/media/psf/Home/workspace/github/seastar/contrib/gmp/include --with-lib-path=/media/psf/Home/workspace/github/seastar/contrib/gmp/lib
+  CFLAGS=-I/media/psf/Home/workspace/github/seastar/contrib/gmp/include LDFLAGS=-L/media/psf/Home/workspace/github/seastar/contrib/gmp/lib make ;make install
+#+END_SRC
+
+** numactl
+
+#+BEGIN_SRC shell
+   wget https://github.com/numactl/numactl/releases/download/v2.0.12/numactl-2.0.12.tar.gz
+
+  tar -xvf numactl-2.0.12.tar.gz
+
+  ./configure --prefix=/media/psf/Home/workspace/github/seastar/contrib/numactl --enable-static=yes --enable-shared=no
+  make ;make install
+#+END_SRC
+
+** zlib
+
+#+BEGIN_SRC shell
+  wget https://zlib.net/zlib-1.2.11.tar.gz
+  CC=gcc ./configure --static --prefix=/media/psf/Home/workspace/github/seastar/contrib/zlib
+  make
+  make install
+#+END_SRC
+
+
+** Protobuf
+dnf install https://extras.getpagespeed.com/release-el8-latest.rpm
+dnf install protobuf-devel
+
+#+BEGIN_SRC shell
+  git clone https://github.com/protocolbuffers/protobuf.git
+  git checkout v2.5.0
+  wget https://github.com/google/googletest/archive/release-1.5.0.tar.gz
+   mv googletest-release-1.5.0 gtest
+  ./autogen.sh 
+  ./configure --prefix=/media/psf/Home/workspace/github/seastar/contrib/protobuf
+   make -j10 ;make install
+#+END_SRC
+** hwloc
+
+#+BEGIN_SRC shell
+  #https://download.open-mpi.org/release/hwloc/v2.2/hwloc-2.2.0.tar.gz
+  git clone https://github.com/open-mpi/hwloc.git
+  git checkout hwloc-1.11.2
+  ./autogen.sh 
+  ./configure --enable-shared=no --enable-static=yes --prefix=/media/psf/Home/workspace/github/seastar/contrib/hwloc
+  make -j10 ;make install
+#+END_SRC
+
+** yaml-cpp
+
+#+BEGIN_SRC shell
+ #https://github.com/jbeder/yaml-cpp/archive/yaml-cpp-0.5.3.tar.gz
+  git clone https://github.com/jbeder/yaml-cpp.git
+  git checkout release-0.5.0
+
+  cmake -DBOOST_ROOT=/media/psf/Home/workspace/github/seastar/contrib/boost -DCMAKE_INSTALL_PREFIX=/media/psf/Home/workspace/github/seastar/contrib/yaml-cpp ..
+  make ; make install
+#+END_SRC
+
+** lksctp-tools
+
+#+BEGIN_SRC shell
+  git clone https://github.com/sctp/lksctp-tools.git
+  git checkout v1.0.18
+  ./bootstrap 
+  ./configure --enable-shared=no --enable-static --prefix=/media/psf/Home/workspace/github/seastar/contrib/lksctp-tools
+  make ;make install
+#+END_SRC
+
+**  rt
+
+#+BEGIN_SRC shell
+  git clone https://github.com/bestpractical/rt.git
+  git checkout rt-5.0.0
+#+END_SRC
+
