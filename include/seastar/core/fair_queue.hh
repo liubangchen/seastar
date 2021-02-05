@@ -21,13 +21,15 @@
  */
 #pragma once
 
+#include <boost/intrusive/slist.hpp>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/util/noncopyable_function.hh>
 #include <atomic>
 #include <queue>
 #include <chrono>
 #include <unordered_set>
+
+namespace bi = boost::intrusive;
 
 namespace seastar {
 
@@ -110,6 +112,7 @@ public:
      */
     fair_queue_ticket maybe_ahead_of(const fair_group_rover& other) const noexcept;
     fair_group_rover operator+(fair_queue_ticket t) const noexcept;
+    fair_group_rover& operator+=(fair_queue_ticket t) noexcept;
 
     friend std::ostream& operator<<(std::ostream& os, fair_group_rover r);
 };
@@ -117,16 +120,29 @@ public:
 /// \addtogroup io-module
 /// @{
 
+class fair_queue_entry {
+    friend class fair_queue;
+
+    fair_queue_ticket _ticket;
+    bi::slist_member_hook<> _hook;
+
+public:
+    fair_queue_entry(fair_queue_ticket t) noexcept
+        : _ticket(std::move(t)) {}
+    using container_list_t = bi::slist<fair_queue_entry,
+            bi::constant_time_size<false>,
+            bi::cache_last<true>,
+            bi::member_hook<fair_queue_entry, bi::slist_member_hook<>, &fair_queue_entry::_hook>>;
+
+    fair_queue_ticket ticket() const noexcept { return _ticket; }
+};
+
 /// \cond internal
 class priority_class {
-    struct request {
-        noncopyable_function<void()> func;
-        fair_queue_ticket desc;
-    };
     friend class fair_queue;
     uint32_t _shares = 0;
     float _accumulated = 0;
-    circular_buffer<request> _queue;
+    fair_queue_entry::container_list_t _queue;
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
@@ -188,7 +204,7 @@ public:
     explicit fair_group(config cfg) noexcept;
 
     fair_queue_ticket maximum_capacity() const noexcept { return _maximum_capacity; }
-    std::pair<fair_queue_ticket, fair_group_rover> grab_capacity(fair_queue_ticket cap) noexcept;
+    fair_group_rover grab_capacity(fair_queue_ticket cap) noexcept;
     void release_capacity(fair_queue_ticket cap) noexcept;
 
     fair_group_rover head() const noexcept {
@@ -228,8 +244,6 @@ public:
         float ticket_weight_pace;
     };
 private:
-    friend priority_class;
-
     struct class_compare {
         bool operator() (const priority_class_ptr& lhs, const priority_class_ptr& rhs) const {
             return lhs->_accumulated > rhs->_accumulated;
@@ -252,18 +266,18 @@ private:
      * When the shared capacity os over the local queue delays
      * further dispatching untill better times
      *
-     * \head  -- the value group head rover should pass by
-     * \cap   -- the capacity that's waited for
+     * \orig_tail  -- the value group tail rover had when it happened
+     * \cap   -- the capacity that's accounted on the group
      *
      * The last field is needed to "rearm" the wait in case
      * queue decides that it wants to dispatch another capacity
      * in the middle of the waiting
      */
     struct pending {
-        fair_group_rover head;
+        fair_group_rover orig_tail;
         fair_queue_ticket cap;
 
-        pending(fair_group_rover h, fair_queue_ticket c) noexcept : head(h), cap(c) {}
+        pending(fair_group_rover t, fair_queue_ticket c) noexcept : orig_tail(t), cap(c) {}
     };
 
     std::optional<pending> _pending;
@@ -313,21 +327,19 @@ public:
     /// \return the amount of resources (weight, size) currently executing
     fair_queue_ticket resources_currently_executing() const;
 
-    /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
-    ///
-    /// It is expected that \c func doesn't throw. If it does throw, it will be just removed from
-    /// the queue and discarded.
+    /// Queue the entry \c ent through this class' \ref fair_queue
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyable_function<void()> func);
+    void queue(priority_class_ptr pc, fair_queue_entry& ent);
 
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_ticket structure describing the request that just finished.
     void notify_requests_finished(fair_queue_ticket desc, unsigned nr = 1) noexcept;
+    void notify_request_cancelled(fair_queue_entry& ent) noexcept;
 
     /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests();
+    void dispatch_requests(std::function<void(fair_queue_entry&)> cb);
 
     clock_type next_pending_aio() const noexcept {
         if (_pending) {
@@ -341,7 +353,8 @@ public:
              * which's sub-optimal. The expectation is that we think disk
              * works faster, than it really does.
              */
-            fair_queue_ticket over = _pending->head.maybe_ahead_of(_group.head());
+            fair_group_rover pending_head = _pending->orig_tail + _pending->cap;
+            fair_queue_ticket over = pending_head.maybe_ahead_of(_group.head());
             return std::chrono::steady_clock::now() + duration(over);
         }
 
